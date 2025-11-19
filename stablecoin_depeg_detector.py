@@ -123,14 +123,23 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-# SHAP
+# SHAP explainability
 explainer = shap.TreeExplainer(model)
-shap_values = explainer.shap_values(X_test)
-shap.summary_plot(shap_values[1], X_test, plot_type="bar", show=False)
+raw_shap = explainer.shap_values(X_test)
+
+# Handle binary classifier output shape
+if isinstance(raw_shap, list):
+    shap_values = raw_shap[1]
+else:
+    shap_values = raw_shap
+
+shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
 plt.tight_layout()
 plt.savefig("shap_feature_importance.png", dpi=300)
 plt.show()
+
 print("Saved SHAP feature importance plot.")
+
 
 # Save model
 with open("anomaly_classifier.pkl", "wb") as f:
