@@ -1,11 +1,16 @@
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, roc_curve, auc
+from sklearn.model_selection import train_test_split
+import shap
+import pickle
 
-# Fetch price and volume data
 coins = ["usd-coin", "tether", "dai"]
 data = {}
 
+# Fetch data
 for coin in coins:
     url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=90"
     resp = requests.get(url).json()
@@ -21,17 +26,15 @@ for coin in coins:
 
 df = pd.concat(data.values())
 
-# Peg deviation and volatility
+# Basic features
 df["peg"] = 1.0
 df["deviation"] = df["price"] - 1
 df["abs_dev"] = df["deviation"].abs()
-
 df["rolling_std"] = df.groupby("coin")["price"].transform(lambda x: x.rolling(7).std())
 df["rolling_vol"] = df.groupby("coin")["volume"].transform(lambda x: x.rolling(7).mean())
-
 df["z_score"] = df["deviation"] / df["rolling_std"]
 
-# Depeg event detection
+# Depeg events
 DEPEG_THRESHOLD = -0.003
 events = []
 
@@ -50,11 +53,9 @@ for coin in coins:
         elif not row["is_depeg"] and in_event:
             end_date = row["date"]
             duration = (end_date - start_date).days
-
             period = coin_df[(coin_df["date"] >= start_date) & (coin_df["date"] <= end_date)]
             min_price = period["price"].min()
             max_dev = period["abs_dev"].max()
-
             events.append([coin, start_date.date(), end_date.date(), duration, min_price, max_dev])
             in_event = False
 
@@ -62,30 +63,87 @@ events_df = pd.DataFrame(events, columns=[
     "coin", "start_date", "end_date", "duration_days", "min_price", "max_deviation"
 ])
 
-print("\nDEPEG EVENTS DETECTED\n")
-print(events_df if not events_df.empty else "No depeg events in the last 90 days.")
+print("\nDEPEG EVENTS\n")
+print(events_df if not events_df.empty else "No depeg events detected.")
 
-# Liquidity-adjusted risk score
+# Liquidity-adjusted stability
 df["liquidity_risk"] = 1 / (df["rolling_vol"] + 1e-6)
 df["combined_risk"] = df["abs_dev"] * df["liquidity_risk"]
 
 risk_scores = df.groupby("coin")[["abs_dev", "combined_risk"]].mean()
 risk_scores.columns = ["peg_risk", "liquidity_adjusted_risk"]
 
-print("\nSTABILITY AND LIQUIDITY RISK SCORES\n")
+print("\nRISK SCORES\n")
 print(risk_scores.sort_values("liquidity_adjusted_risk", ascending=False))
 
-# Plot price data
-fig, ax1 = plt.subplots(figsize=(12, 6))
+# Classifier
+df["anomaly"] = (df["z_score"].abs() > 3).astype(int)
+df = df.dropna()
 
-for coin in coins:
-    subset = df[df["coin"] == coin]
-    ax1.plot(subset["date"], subset["price"], label=f"{coin} price")
+features = df[[
+    "price",
+    "deviation",
+    "abs_dev",
+    "rolling_std",
+    "rolling_vol",
+    "liquidity_risk",
+    "combined_risk"
+]]
 
-ax1.axhline(1.0, color="black", linestyle="--")
-ax1.set_ylabel("Price (USD)")
-ax1.set_title("Stablecoin Peg Stability (90 Days)")
+labels = df["anomaly"]
 
+X_train, X_test, y_train, y_test = train_test_split(
+    features, labels, test_size=0.3, random_state=42, stratify=labels
+)
+
+model = RandomForestClassifier(n_estimators=150, random_state=42)
+model.fit(X_train, y_train)
+
+preds = model.predict(X_test)
+prob = model.predict_proba(X_test)[:, 1]
+
+acc = accuracy_score(y_test, preds)
+cm = confusion_matrix(y_test, preds)
+
+print("\nCLASSIFIER PERFORMANCE\n")
+print("Accuracy:", round(acc, 4))
+print("\nConfusion Matrix:\n", cm)
+
+# ROC
+fpr, tpr, thresholds = roc_curve(y_test, prob)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6,6))
+plt.plot(fpr, tpr, label='AUC=%0.3f' % roc_auc)
+plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve - Anomaly Classifier")
 plt.legend()
 plt.tight_layout()
+plt.show()
+
+# SHAP
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test)
+shap.summary_plot(shap_values[1], X_test, plot_type="bar", show=False)
+plt.tight_layout()
+plt.savefig("shap_feature_importance.png", dpi=300)
+plt.show()
+print("Saved SHAP feature importance plot.")
+
+# Save model
+with open("anomaly_classifier.pkl", "wb") as f:
+    pickle.dump(model, f)
+print("Saved model to anomaly_classifier.pkl")
+
+# Plot price lines
+fig, ax = plt.subplots(figsize=(12,6))
+for coin in coins:
+    subset = df[df["coin"] == coin]
+    ax.plot(subset["date"], subset["price"], label=coin)
+ax.axhline(1.0, color="black", linestyle="--")
+ax.set_title("Stablecoin Prices")
+ax.set_ylabel("Price (USD)")
+plt.legend()
 plt.show()
